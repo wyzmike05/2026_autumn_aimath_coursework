@@ -1,0 +1,7 @@
+data/
+__pycache__/
+
+outputs/
+
+IR_SDE_DDIM_Constant_Theta_Algorithms.md
+IR-SDE_算法笔记_校订版.md
