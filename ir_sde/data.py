@@ -17,12 +17,37 @@ class NoisyMNISTDataset(Dataset):
     Probabilities select one recipe per slot, rather than exact dataset counts.
     """
 
+    NOISE_TYPES = ("gaussian", "salt_pepper", "speckle", "mixed")
     DEFAULT_NOISE_PROBS = {
-        "gaussian": 0.5,
-        "salt_pepper": 0.5,
-        "speckle": 0.0,
-        "mixed": 0.0,
+        "gaussian": 0.25,
+        "salt_pepper": 0.25,
+        "speckle": 0.25,
+        "mixed": 0.25,
     }
+    DEFAULT_NOISE_RANGES = {
+        "gaussian": (0.05, 0.20),
+        "salt_pepper": (0.01, 0.08),
+        "speckle": (0.10, 0.30),
+        "mixed_gaussian": (0.03, 0.12),
+        "mixed_salt_pepper": (0.01, 0.04),
+    }
+
+    @classmethod
+    def validate_noise_probs(cls, noise_probs=None):
+        """Validate probabilities and fill omitted noise types with zero."""
+        values = cls.DEFAULT_NOISE_PROBS if noise_probs is None else noise_probs
+        if not values or set(values) - set(cls.NOISE_TYPES):
+            raise ValueError(f"noise_probs must use these names: {', '.join(cls.NOISE_TYPES)}")
+        try:
+            probabilities = {name: float(values.get(name, 0.0)) for name in cls.NOISE_TYPES}
+        except (TypeError, ValueError) as error:
+            raise ValueError("Noise probabilities must be numeric") from error
+        total = sum(probabilities.values())
+        if any(not math.isfinite(p) or p < 0 for p in probabilities.values()) or not math.isclose(
+            total, 1.0, rel_tol=0.0, abs_tol=1e-6
+        ):
+            raise ValueError("Noise probabilities must be finite, nonnegative and sum to 1")
+        return {name: p / total for name, p in probabilities.items()}
 
     def __init__(
         self,
@@ -31,6 +56,7 @@ class NoisyMNISTDataset(Dataset):
         noise_probs=None,
         seed: int = 42,
         samples_per_image: int = 1,
+        noise_ranges=None,
     ):
         if (
             isinstance(samples_per_image, bool)
@@ -41,20 +67,19 @@ class NoisyMNISTDataset(Dataset):
         self.samples_per_image = samples_per_image
         self.train = train
         self.seed = seed
-        self.noise_probs = dict(
-            self.DEFAULT_NOISE_PROBS if noise_probs is None else noise_probs
-        )
-        if not self.noise_probs or any(
-            name not in self.DEFAULT_NOISE_PROBS for name in self.noise_probs
-        ):
-            raise ValueError("noise_probs must contain supported noise names")
+        self.noise_ranges = dict(self.DEFAULT_NOISE_RANGES)
+        if noise_ranges is not None:
+            if set(noise_ranges) - self.noise_ranges.keys():
+                raise ValueError("Unknown noise strength range")
+            self.noise_ranges.update(noise_ranges)
+        for name, bounds in self.noise_ranges.items():
+            if len(bounds) != 2 or not all(math.isfinite(v) for v in bounds):
+                raise ValueError(f"Invalid noise range: {name}")
+            low, high = bounds
+            if not 0 <= low <= high or ("salt_pepper" in name and high > 1):
+                raise ValueError(f"Invalid noise range: {name}")
+        self.noise_probs = self.validate_noise_probs(noise_probs)
         weights = list(self.noise_probs.values())
-        if any(not math.isfinite(p) or p < 0 for p in weights) or not math.isclose(
-            sum(weights), 1.0, abs_tol=1e-6
-        ):
-            raise ValueError(
-                "Noise probabilities must be finite, nonnegative and sum to 1"
-            )
         self.noise_names = list(self.noise_probs)
         self.noise_weights = torch.tensor(weights, dtype=torch.float64)
         self.data = MNIST(root=root, train=train, download=True, transform=ToTensor())
@@ -82,17 +107,19 @@ class NoisyMNISTDataset(Dataset):
 
     def _corrupt(self, img, kind, generator):
         if kind == "gaussian":
-            sigma = self._uniform(0.05, 0.5, generator)
+            sigma = self._uniform(*self.noise_ranges["gaussian"], generator)
             return img + sigma * torch.randn(img.shape, generator=generator)
         if kind == "salt_pepper":
-            return self._salt_pepper(img, 0.01, 0.08, generator)
+            return self._salt_pepper(img, *self.noise_ranges["salt_pepper"], generator)
         if kind == "speckle":
-            sigma = self._uniform(0.10, 0.30, generator)
+            sigma = self._uniform(*self.noise_ranges["speckle"], generator)
             return img + img * sigma * torch.randn(img.shape, generator=generator)
         if kind == "mixed":
-            sigma = self._uniform(0.03, 0.12, generator)
+            sigma = self._uniform(*self.noise_ranges["mixed_gaussian"], generator)
             noisy = img + sigma * torch.randn(img.shape, generator=generator)
-            return self._salt_pepper(noisy, 0.01, 0.04, generator)
+            return self._salt_pepper(
+                noisy, *self.noise_ranges["mixed_salt_pepper"], generator
+            )
         raise ValueError(f"Unsupported noise type: {kind}")
 
     def _salt_pepper(self, img, low, high, generator):

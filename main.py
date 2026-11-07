@@ -32,7 +32,7 @@ def train_epoch(
     lr_scheduler=None,
 ):
     unet.train()
-    total, count = 0.0, 0
+    total, total_noise, count = 0.0, 0.0, 0
     progress = tqdm(loader, desc=description, unit="batch", dynamic_ncols=True)
     for y, x0 in progress:
         y, x0 = y.to(device), x0.to(device)
@@ -40,7 +40,11 @@ def train_epoch(
         noise = torch.randn_like(x0)
         xt = scheduler.add_noise(x0, noise, t, y)
         prediction = unet(torch.cat([xt, y], dim=1), t).sample
-        loss = F.mse_loss(prediction, noise)
+        target = x0 if scheduler.config.prediction_type == "sample" else noise
+        loss = F.mse_loss(prediction, target)
+        with torch.no_grad():
+            _, predicted_noise = scheduler.prediction_to_x0_noise(prediction, xt, t, y)
+            noise_mse = F.mse_loss(predicted_noise, noise).item()
         if not torch.isfinite(loss):
             raise RuntimeError("Non-finite training loss")
         optimizer.zero_grad(set_to_none=True)
@@ -56,21 +60,24 @@ def train_epoch(
                 {
                     "global_batch": len(batch_history) + 1,
                     "epoch": epoch,
-                    "train_noise_mse": batch_loss,
+                    "train_loss": batch_loss,
+                    "train_noise_mse": noise_mse,
                     "lr": current_lr,
                 }
             )
         total += batch_loss * x0.size(0)
+        total_noise += noise_mse * x0.size(0)
         count += x0.size(0)
         progress.set_postfix(
-            noise_mse=f"{batch_loss:.6f}",
-            avg_mse=f"{total / count:.6f}",
+            loss=f"{batch_loss:.6f}",
+            noise_mse=f"{noise_mse:.6f}",
+            avg_loss=f"{total / count:.6f}",
             lr=f"{current_lr:.3e}",
             refresh=True,
         )
     if count == 0:
         raise ValueError("Training loader must not be empty")
-    return total / count
+    return total / count, total_noise / count
 
 
 @torch.no_grad()
@@ -120,9 +127,20 @@ def parse_args():
         "--theta",
         type=float,
         default=None,
-        help="Rate per integer step; default: 40 / timesteps",
+        help="Rate per integer step; default: 5.0 / timesteps",
     )
     parser.add_argument("--lam", type=float, default=0.1)
+    parser.add_argument(
+        "--noise-probs", type=float, nargs=4, default=None,
+        metavar=("GAUSSIAN", "SALT_PEPPER", "SPECKLE", "MIXED"),
+        help="Noise probabilities in this order: gaussian salt_pepper speckle mixed; sum must be 1",
+    )
+    parser.add_argument("--prediction-type", choices=("sample", "epsilon"), default="sample",
+                        help="Predict clean image (stable default) or diffusion noise")
+    parser.add_argument("--gaussian-sigma", type=float, nargs=2, default=(0.05, 0.20),
+                        metavar=("MIN", "MAX"), help="Gaussian corruption standard deviation range")
+    parser.add_argument("--salt-pepper-amount", type=float, nargs=2, default=(0.01, 0.08),
+                        metavar=("MIN", "MAX"), help="Fraction of pixels selected for salt/pepper replacement")
     parser.add_argument("--inference-steps", type=int, default=20)
     parser.add_argument("--train-samples", type=int, default=None)
     parser.add_argument("--test-samples", type=int, default=None)
@@ -156,6 +174,13 @@ def parse_args():
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     args = parser.parse_args()
+    try:
+        args.noise_probs = NoisyMNISTDataset.validate_noise_probs(
+            None if args.noise_probs is None else
+            dict(zip(NoisyMNISTDataset.NOISE_TYPES, args.noise_probs))
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if not all(math.isfinite(v) for v in (args.lr, args.lam)) or (
         args.theta is not None and not math.isfinite(args.theta)
     ):
@@ -170,6 +195,12 @@ def parse_args():
         parser.error("num-workers must be nonnegative")
     if args.eval_every < 1 or args.eval_samples < 1:
         parser.error("eval-every and eval-samples must be positive")
+    for name, bounds in (("gaussian-sigma", args.gaussian_sigma),
+                         ("salt-pepper-amount", args.salt_pepper_amount)):
+        if not all(math.isfinite(v) for v in bounds) or not 0 <= bounds[0] <= bounds[1]:
+            parser.error(f"{name} must be a finite nonnegative increasing range")
+    if args.salt_pepper_amount[1] > 1:
+        parser.error("salt-pepper-amount must be <= 1")
     if args.samples_per_image < 1 or args.test_samples_per_image < 1:
         parser.error("samples-per-image and test-samples-per-image must be positive")
     for limit in (args.train_samples, args.test_samples):
@@ -184,6 +215,7 @@ def save_history(history, batch_history, output):
         "epoch",
         "global_batch",
         "train_noise_mse",
+        "train_loss",
         "test_noisy_mse",
         "test_restored_mse",
         "test_noisy_psnr",
@@ -199,14 +231,14 @@ def save_history(history, batch_history, output):
         json.dump(batch_history, file, indent=2)
     with (output / "batch_history.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
-            file, fieldnames=["global_batch", "epoch", "train_noise_mse", "lr"]
+            file, fieldnames=["global_batch", "epoch", "train_loss", "train_noise_mse", "lr"]
         )
         writer.writeheader()
         writer.writerows(batch_history)
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(
         [r["global_batch"] for r in batch_history],
-        [r["train_noise_mse"] for r in batch_history],
+        [r["train_loss"] for r in batch_history],
         linewidth=0.8,
         alpha=0.65,
         label="Train loss (each batch)",
@@ -216,7 +248,7 @@ def save_history(history, batch_history, output):
         ax.axvline(step, color="gray", linestyle=":", alpha=0.4)
         ax.scatter(
             step,
-            batch_history[step - 1]["train_noise_mse"],
+            batch_history[step - 1]["train_loss"],
             color="tab:blue",
             s=25,
             zorder=4,
@@ -252,7 +284,7 @@ def save_history(history, batch_history, output):
             label=f"Fixed test {kind} PSNR",
         )
     ax.set_xlabel("Global training batch (continuous across epochs)")
-    ax.set_ylabel("MSE / noise prediction loss")
+    ax.set_ylabel("MSE / training loss")
     psnr_ax.set_ylabel("PSNR (dB)")
     ax.set_title("Training and fixed test history", pad=30)
     ax.grid(alpha=0.3)
@@ -268,21 +300,28 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    theta = 40.0 / args.timesteps if args.theta is None else args.theta
-    scheduler = IRSdeScheduler(T=args.timesteps, theta=theta, lam=args.lam)
+    theta = 5.0 / args.timesteps if args.theta is None else args.theta
+    scheduler = IRSdeScheduler(T=args.timesteps, theta=theta, lam=args.lam,
+                              prediction_type=args.prediction_type)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    noise_ranges = {"gaussian": args.gaussian_sigma,
+                    "salt_pepper": args.salt_pepper_amount}
     train_data = NoisyMNISTDataset(
         root=args.data_root,
         train=True,
         seed=args.seed,
         samples_per_image=args.samples_per_image,
+        noise_probs=args.noise_probs,
+        noise_ranges=noise_ranges,
     )
     test_data = NoisyMNISTDataset(
         root=args.data_root,
         train=False,
         seed=args.seed,
         samples_per_image=args.test_samples_per_image,
+        noise_probs=args.noise_probs,
+        noise_ranges=noise_ranges,
     )
     if args.train_samples is not None:
         train_data = Subset(train_data, range(min(args.train_samples, len(train_data))))
@@ -318,6 +357,7 @@ def main():
             {
                 "indices": eval_indices,
                 "seed": args.seed,
+                "noise_probs": args.noise_probs,
                 "inference_steps": args.inference_steps,
                 "test_samples_per_image": args.test_samples_per_image,
             },
@@ -329,7 +369,9 @@ def main():
             {
                 **vars(args),
                 "theta": theta,
-                "noise_probs": NoisyMNISTDataset.DEFAULT_NOISE_PROBS,
+                "noise_probs": args.noise_probs,
+                "noise_ranges": {**NoisyMNISTDataset.DEFAULT_NOISE_RANGES, **noise_ranges},
+                "lr_schedule": "cosine",
             },
             file,
             indent=2,
@@ -339,17 +381,18 @@ def main():
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.lr)
     # Step after each optimizer update; decay continuously across epoch boundaries.
     total_steps = args.epochs * len(train_loader)
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: max(0.0, 1.0 - step / total_steps)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=0.0
     )
     print(
         f"Device: {device}; train: {len(train_data)}; test: {len(test_data)}",
         flush=True,
     )
+    print(f"Noise probabilities: {args.noise_probs}", flush=True)
     history = []
     batch_history = []
     for epoch in range(1, args.epochs + 1):
-        loss = train_epoch(
+        loss, noise_mse = train_epoch(
             unet,
             scheduler,
             train_loader,
@@ -360,12 +403,13 @@ def main():
             epoch=epoch,
             lr_scheduler=lr_scheduler,
         )
-        print(f"Epoch {epoch}/{args.epochs}: noise MSE = {loss:.6f}", flush=True)
+        print(f"Epoch {epoch}/{args.epochs}: loss = {loss:.6f}, noise MSE = {noise_mse:.6f}", flush=True)
         history.append(
             {
                 "epoch": epoch,
                 "global_batch": len(batch_history),
-                "train_noise_mse": loss,
+                "train_loss": loss,
+                "train_noise_mse": noise_mse,
             }
         )
         if epoch % args.eval_every == 0 or epoch == args.epochs:
@@ -412,8 +456,22 @@ def main():
     )
     unet.save_pretrained(output / "unet")
     scheduler.save_pretrained(output / "scheduler")
+    per_noise = {}
+    for kind, probability in args.noise_probs.items():
+        if probability == 0:
+            continue
+        dataset = NoisyMNISTDataset(
+            root=args.data_root, train=False, noise_probs={kind: 1.0}, seed=args.seed,
+            samples_per_image=args.test_samples_per_image, noise_ranges=noise_ranges,
+        )
+        loader = DataLoader(Subset(dataset, eval_indices), batch_size=args.batch_size,
+                            generator=torch.Generator().manual_seed(args.seed))
+        per_noise[kind] = evaluate(
+            unet, scheduler, loader, device, args.inference_steps,
+            args.seed, output / f"comparison_{kind}.png",
+        )
     with (output / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump({"history": history, **metrics}, file, indent=2)
+        json.dump({"history": history, **metrics, "per_noise": per_noise}, file, indent=2)
     print(json.dumps(metrics, indent=2), flush=True)
     print(f"Saved results to {output.resolve()}")
 

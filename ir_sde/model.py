@@ -1,4 +1,8 @@
-"""Conditional noise predictor and deterministic IR-SDE restoration sampler."""
+"""Conditional predictor and deterministic IR-SDE restoration sampler.
+
+The observed image y can come from any mixture configured in NoisyMNISTDataset.
+Mixture probabilities affect data generation, not the Gaussian SDE coefficients.
+"""
 
 import math
 from typing import List
@@ -14,13 +18,16 @@ class IRSdeScheduler(SchedulerMixin, ConfigMixin):
     """常数回复速率 theta，离散时间步为 0,1,...,T。"""
 
     @register_to_config
-    def __init__(self, T: int = 100, theta: float = 0.05, lam: float = 0.1):
+    def __init__(self, T: int = 100, theta: float = 0.05, lam: float = 0.1,
+                 prediction_type: str = "epsilon", clip_sample: bool = True):
         if isinstance(T, bool) or not isinstance(T, int) or T < 1:
             raise ValueError("T must be a positive integer.")
         if not all(math.isfinite(value) and value > 0 for value in (theta, lam)):
             raise ValueError("theta and lam must be positive.")
-        if theta * T > 80:
-            raise ValueError("theta*T must be <= 80 for float32 sampling; use theta=5/T.")
+        if theta * T > 10:
+            raise ValueError("theta*T must be <= 10 to avoid severe signal loss; use theta=5/T.")
+        if prediction_type not in ("epsilon", "sample"):
+            raise ValueError("prediction_type must be 'epsilon' or 'sample'")
 
         self.T = T
         t = torch.arange(T + 1, dtype=torch.float64)
@@ -44,6 +51,22 @@ class IRSdeScheduler(SchedulerMixin, ConfigMixin):
         a = self.a[t.cpu()].to(x0).reshape(shape)
         v = self.v[t.cpu()].to(x0).reshape(shape)
         return y + a * (x0 - y) + v.sqrt() * noise
+
+    def prediction_to_x0_noise(self, model_output, sample, t, y, clip=False):
+        """Convert either network target to a consistent (x0, epsilon) pair."""
+        t = torch.as_tensor(t, device=sample.device, dtype=torch.long).reshape(-1)
+        shape = (-1,) + (1,) * (sample.ndim - 1)
+        a = self.a.to(sample)[t].reshape(shape)
+        sigma = self.v.to(sample)[t].sqrt().reshape(shape)
+        if self.config.prediction_type == "sample":
+            x0 = model_output
+        else:
+            x0 = y + (sample - y - sigma * model_output) / a
+        if clip:
+            x0 = x0.clamp(0, 1)
+        # Recompute epsilon after clipping, so the DDIM path remains consistent.
+        noise = (sample - y - a * (x0 - y)) / sigma
+        return x0, noise
 
     def set_timesteps(
         self,
@@ -94,16 +117,17 @@ class IRSdeScheduler(SchedulerMixin, ConfigMixin):
             raise ValueError("Require 0 <= prev_timestep < timestep <= T")
         if sample.shape != y.shape or sample.shape != model_output.shape:
             raise ValueError("sample, y and model_output must have the same shape")
-        ratio = (self.a[j] / self.a[i]).item()
-        # Group the residual before scaling to reduce cancellation of large terms.
+        x0, noise = self.prediction_to_x0_noise(
+            model_output, sample, i, y, clip=self.config.clip_sample
+        )
         return SchedulerOutput(
-            prev_sample=y + ratio * (sample - y - self.v[i].sqrt().item() * model_output)
-            + self.v[j].sqrt().item() * model_output
+            prev_sample=y + self.a[j].item() * (x0 - y)
+            + self.v[j].sqrt().item() * noise
         )
 
 
 def make_mnist_unet():
-    """输入两个通道 [x_t, y]，输出一通道高斯噪声预测。"""
+    """输入 [x_t, y]；单通道输出含义由 scheduler.prediction_type 指定。"""
     return UNet2DModel(
         sample_size=28,
         in_channels=2,
@@ -155,8 +179,8 @@ class IRSdePipeline(DiffusionPipeline):
             zip(self.scheduler.timesteps, self.scheduler.prev_timesteps),
             total=len(self.scheduler.timesteps),
         ):
-            eps = self.unet(torch.cat([x, y], dim=1), t).sample
-            x = self.scheduler.step(eps, t, x, y, prev_t).prev_sample
+            prediction = self.unet(torch.cat([x, y], dim=1), t).sample
+            x = self.scheduler.step(prediction, t, x, y, prev_t).prev_sample
 
         if not torch.isfinite(x).all():
             raise RuntimeError("Non-finite sampling result before clamping")
