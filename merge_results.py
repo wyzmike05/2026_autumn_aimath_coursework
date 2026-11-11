@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pandas as pd
 
-IR_METRICS   = Path("outputs/ir_sde/metrics.json")
-TRAD_METRICS = Path("outputs/traditional_single/metrics.json")
-OUT_DIR      = Path("outputs/combined")
+IR_METRICS   = Path("outputs/mnist/ir_sde/metrics.json")
+TRAD_METRICS = Path("outputs/mnist/traditional_single/metrics.json")
+OUT_DIR      = Path("outputs/mnist/combined")
 OUT_CSV      = OUT_DIR / "summary_combined.csv"
 
 def main() -> None:
