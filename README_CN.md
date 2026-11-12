@@ -14,7 +14,7 @@
 | MNIST | 单通道灰度图 | 28×28 | IR-SDE 与六种传统方法在四类合成噪声下的去噪对比 |
 | CIFAR-10 | 三通道 RGB 彩色图 | 32×32 | IR-SDE 与六种传统方法在四类合成噪声下的去噪对比 |
 
-四类噪声为高斯、椒盐、散斑和混合噪声。项目关注的不只是降低像素误差，也包括去噪时对边缘、纹理和结构的保留。代码记录 PSNR；CIFAR-10 的 IR-SDE 与传统方法还记录 SSIM。**当前 MNIST IR-SDE 评估未计算 SSIM**，所以 MNIST 合并表中 IR-SDE 的 SSIM 项为空，不应作为 0 或与传统方法的 SSIM 作直接比较。
+四类噪声为高斯、椒盐、散斑和混合噪声。项目关注的不只是降低像素误差，也包括去噪时对边缘、纹理和结构的保留。两套实验均提供 PSNR 和 SSIM 指标。
 
 请在项目根目录执行下列命令。
 
@@ -148,6 +148,8 @@ outputs/mnist/combined/summary_combined.csv
 
 当前仓库版本已将 MNIST 合并脚本配置为上述 `outputs/mnist/` 路径。
 
+注：由于原始 MNIST 代码未实现 SSIM 计算，项目新增了 `eval_mnist_ssim.py` 脚本，加载已训练的模型权重进行了 SSIM 指标的单独评估与补全，确保了与传统基线在 PSNR 和 SSIM 上的全面对齐。
+
 ## CIFAR-10 实验启动步骤
 
 ### 1. 冒烟测试
@@ -202,7 +204,7 @@ python merge_results_cifar.py
 
 - PSNR 由整个评估集合的全局 MSE 计算，数值越高通常表示像素误差越小。
 - SSIM 衡量图像结构相似度，有助于讨论结构保留，但不能单独证明纹理或颜色伪影。
-- MNIST 的当前 IR-SDE `evaluate` 未计算 SSIM，因此合并表中相应值为空；请勿把空值当成 0。
+- MNIST 的 IR-SDE SSIM 已通过 `eval_mnist_ssim.py` 补算完成，并已更新至合并表。
 - MNIST 和 CIFAR-10 的分辨率、通道数及噪声强度范围不同。跨数据集比较时应说明实验配置差异。
 
 ## 技术亮点与局限
