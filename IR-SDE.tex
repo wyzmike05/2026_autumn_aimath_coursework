@@ -1,0 +1,692 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{xeCJK}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\geometry{left=2.6cm,right=2.6cm,top=2.5cm,bottom=2.5cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{2em}
+\allowdisplaybreaks[2]
+\renewcommand{\arraystretch}{1.2}
+
+\title{\textbf{IR-SDE 方法介绍与数学推导}\\[0.6em]
+\large 基于 CIFAR-10 条件图像恢复实现}
+\author{周奕兵}
+\date{}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{3cm}
+  {\Huge\bfseries IR-SDE 方法介绍与数学推导\par}
+  \vspace{1.2cm}
+  {\Large 基于 CIFAR-10 条件图像恢复实现\par}
+  \vspace{2.2cm}
+  {\large 大作业第三部分\par}
+  \vspace{0.6cm}
+  {\Large 周奕兵\par}
+  \vfill
+  {\large
+    本文从项目中的调度器、训练循环与 CIFAR-10 UNet 配置出发，\\
+    推导前向随机过程、预测目标转换与反向跳步采样。\\[0.8em]
+    编译方式：XeLaTeX
+  \par}
+  \vspace*{1.5cm}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+\section{基础变量定义与条件概率建模}
+
+\subsection{图像、观测与扩散状态}
+
+令一幅干净的 CIFAR-10 RGB 图像为
+\[
+  \bm{x}_0 \in [0,1]^{3\times H\times W},
+\]
+其中项目中的 CIFAR-10 图像分辨率为 \(H=W=32\)，图像经
+\texttt{ToTensor()} 转换到 \([0,1]\) 数值范围。令
+\[
+  \bm{y}\in[0,1]^{3\times H\times W}
+\]
+表示与 \(\bm{x}_0\) 配对的含噪观测图像。数据加载器返回
+\((\bm{y},\bm{x}_0)\)，训练时以 \(\bm{y}\) 为条件恢复 \(\bm{x}_0\)。
+
+这里需要区分两种噪声。数据集构造 \(\bm{y}\) 时可以采用高斯噪声、
+椒盐噪声、乘性散斑噪声或混合噪声，且最终会将观测裁剪到
+\([0,1]\)。这些退化机制描述的是观测模型；它们不等同于下面
+IR-SDE 前向过程中的高斯随机变量。IR-SDE 的扩散噪声由独立标准
+高斯变量构造。
+
+定义连续时间 \(t\geq 0\) 的扩散状态为 \(\bm{x}_t\)，其中
+\(\bm{x}_{t=0}=\bm{x}_0\)。本实现只在整数时刻
+\(t\in\{0,1,\ldots,T\}\) 取训练与推理状态。给定 \(\bm{x}_0\)
+和观测 \(\bm{y}\)，其条件边缘分布为
+\[
+  q(\bm{x}_t\mid \bm{x}_0,\bm{y})
+  =
+  \mathcal{N}\!\left(
+    \bm{y}+a_t(\bm{x}_0-\bm{y}),\,
+    v_t\bm{I}
+  \right).
+\]
+这里的协方差对所有像素通道使用同一标量方差 \(v_t\)，
+\(\bm{I}\) 表示与图像张量维度相匹配的单位算子。
+
+因此，模型的任务不是无条件地从纯噪声生成任意图像，而是学习
+由观测 \(\bm{y}\) 条件化的恢复分布。训练时网络输入同时包含
+当前扩散状态与观测；推理时整个时间序列也以固定的 \(\bm{y}\)
+为条件。理想化地，可将恢复目标写作
+\[
+  p_\theta(\bm{x}_0\mid\bm{y}),
+\]
+而网络在给定时间状态下所学习的预测可表示为
+\[
+  f_\theta(\bm{x}_t,\bm{y},t).
+\]
+其中 \(\theta\) 在 \(p_\theta,f_\theta\) 中表示神经网络参数；
+在 SDE 系数中，\(\theta>0\) 表示回复速率。两者语境不同。
+
+\subsection{条件分布与像素空间直觉}
+
+令
+\[
+  a_t=e^{-\theta t},\qquad
+  v_t=\lambda^2\left(1-e^{-2\theta t}\right),\qquad
+  \sigma_t=\sqrt{v_t}.
+\]
+则上面的条件分布等价于以下重参数化形式：
+\begin{align}
+  \bm{x}_t
+  &=\bm{y}+a_t(\bm{x}_0-\bm{y})+\sigma_t\bm{\epsilon},
+  \label{eq:reparam}
+  \\
+  \bm{\epsilon}&\sim\mathcal{N}(\bm{0},\bm{I}).
+\end{align}
+由此可见，前向过程的条件均值从 \(\bm{x}_0\) 出发，沿着
+\(\bm{x}_0-\bm{y}\) 的方向逐渐缩小；随机项的方差则随时间增长。
+因此，状态在平均意义上向观测 \(\bm{y}\) 靠拢，同时受到以
+\(\bm{y}\) 为中心的高斯扰动。
+
+\section{前向加噪过程：连续 SDE 与离散边缘分布}
+
+\subsection{回复到观测图像的 Ornstein--Uhlenbeck 型 SDE}
+
+考虑以 \(\bm{y}\) 为固定回复中心的随机微分方程
+\begin{equation}
+  d\bm{X}_t
+  =
+  \theta(\bm{y}-\bm{X}_t)\,dt
+  +\sqrt{2\theta}\lambda\,d\bm{W}_t,
+  \qquad
+  \bm{X}_0=\bm{x}_0,
+  \label{eq:sde}
+\end{equation}
+其中 \(\bm{W}_t\) 为与图像张量同维度的标准布朗运动，
+\(\theta>0\) 控制向观测回复的速率，\(\lambda>0\) 控制长期噪声
+标准差。令
+\[
+  \bm{Z}_t=\bm{X}_t-\bm{y}.
+\]
+因为 \(\bm{y}\) 对这条随机轨迹固定，\(d\bm{Z}_t=d\bm{X}_t\)，
+故式 \eqref{eq:sde} 可改写为
+\[
+  d\bm{Z}_t=-\theta\bm{Z}_t\,dt
+  +\sqrt{2\theta}\lambda\,d\bm{W}_t.
+\]
+两侧乘以积分因子 \(e^{\theta t}\)。由 It\^o 乘积公式，
+确定性可微函数 \(e^{\theta t}\) 与随机过程相乘给出
+\begin{align}
+  d\!\left(e^{\theta t}\bm{Z}_t\right)
+  &=\theta e^{\theta t}\bm{Z}_t\,dt
+    +e^{\theta t}d\bm{Z}_t
+  \\
+  &=\theta e^{\theta t}\bm{Z}_t\,dt
+    +e^{\theta t}
+       \left(-\theta\bm{Z}_t\,dt
+       +\sqrt{2\theta}\lambda\,d\bm{W}_t\right)
+  \\
+  &=\sqrt{2\theta}\lambda e^{\theta t}\,d\bm{W}_t.
+\end{align}
+从 \(0\) 积分到 \(t\)，并使用
+\(\bm{Z}_0=\bm{x}_0-\bm{y}\)，得到
+\begin{align}
+  e^{\theta t}\bm{Z}_t
+  &=\bm{x}_0-\bm{y}
+    +\sqrt{2\theta}\lambda
+      \int_0^t e^{\theta s}\,d\bm{W}_s,
+  \\
+  \bm{X}_t
+  &=\bm{y}+e^{-\theta t}(\bm{x}_0-\bm{y})
+    +\sqrt{2\theta}\lambda
+      \int_0^t e^{-\theta(t-s)}\,d\bm{W}_s.
+  \label{eq:ou-solution}
+\end{align}
+It\^o 随机积分是高斯随机变量，均值为零。利用 It\^o 等距公式，
+其逐坐标方差为
+\begin{align}
+  \operatorname{Var}(\bm{X}_t\mid\bm{x}_0,\bm{y})
+  &=2\theta\lambda^2
+    \int_0^t e^{-2\theta(t-s)}\,ds\,\bm{I}
+  \\
+  &=2\theta\lambda^2
+    \left[
+      \frac{e^{-2\theta(t-s)}}{2\theta}
+    \right]_{s=0}^{s=t}\bm{I}
+  \\
+  &=\lambda^2(1-e^{-2\theta t})\bm{I}.
+\end{align}
+同时，条件均值为
+\[
+  \mathbb{E}[\bm{X}_t\mid\bm{x}_0,\bm{y}]
+  =\bm{y}+e^{-\theta t}(\bm{x}_0-\bm{y}).
+\]
+故将 \(a_t=e^{-\theta t}\) 和
+\(v_t=\lambda^2(1-e^{-2\theta t})\) 代入，恰好得到
+式 \eqref{eq:reparam} 的条件高斯边缘分布。
+
+\subsection{精确离散转移与代码中的闭式加噪}
+
+对任意时间间隔 \(\Delta>0\)，从式 \eqref{eq:ou-solution}
+将起始时刻改为 \(t\)，可得精确转移：
+\begin{align}
+  \bm{X}_{t+\Delta}
+  &=\bm{y}+e^{-\theta\Delta}(\bm{X}_t-\bm{y})
+    +\sqrt{2\theta}\lambda
+       \int_t^{t+\Delta}
+         e^{-\theta(t+\Delta-s)}\,d\bm{W}_s
+  \\
+  &=\bm{y}+e^{-\theta\Delta}(\bm{X}_t-\bm{y})
+    +\lambda\sqrt{1-e^{-2\theta\Delta}}\,\bm{\xi}_t,
+  \label{eq:exact-transition}
+\end{align}
+其中 \(\bm{\xi}_t\sim\mathcal{N}(\bm{0},\bm{I})\)。第二行成立是因为
+积分项为零均值高斯变量，其每个分量的方差为
+\[
+  2\theta\lambda^2\int_t^{t+\Delta}
+      e^{-2\theta(t+\Delta-s)}\,ds
+  =\lambda^2(1-e^{-2\theta\Delta}).
+\]
+
+当 \(\Delta=1\) 时，式 \eqref{eq:exact-transition} 给出相邻整数时刻
+的离散转移。更重要的是，代码的 \texttt{add\_noise} 并不需要
+逐步模拟这 \(t\) 次转移；它直接使用从初始状态到时刻 \(t\) 的
+闭式边缘分布。代入 \(a_t,v_t\)，可逐项得到
+\begin{align}
+  \bm{x}_t
+  &=\bm{y}+e^{-\theta t}(\bm{x}_0-\bm{y})
+     +\sqrt{\lambda^2(1-e^{-2\theta t})}\,\bm{\epsilon}
+  \\
+  &=\bm{y}+a_t(\bm{x}_0-\bm{y})
+     +\sqrt{v_t}\,\bm{\epsilon},
+  \qquad \bm{\epsilon}\sim\mathcal{N}(\bm{0},\bm{I}).
+  \label{eq:forward-code}
+\end{align}
+这就是实现中的加噪公式。它是线性变换加高斯随机变量的直接采样，
+而不是 Euler--Maruyama 近似。代码使用
+\(-\operatorname{expm1}(-2\theta t)\) 计算
+\(1-e^{-2\theta t}\)，在 \(t\) 较小时比直接相减更有利于数值精度。
+
+\subsection{边界时刻与有限时间的近似收敛}
+
+在 \(t=0\) 时，
+\[
+  a_0=1,\qquad v_0=0,\qquad \bm{x}_{t=0}=\bm{x}_0.
+\]
+随着 \(t\) 增大，\(a_t\) 单调减小而 \(v_t\) 单调增大。若令
+\(t\to\infty\)，则
+\[
+  a_t\to 0,\qquad v_t\to\lambda^2,
+\]
+因此
+\[
+  q(\bm{x}_t\mid\bm{x}_0,\bm{y})
+  \longrightarrow
+  \mathcal{N}(\bm{y},\lambda^2\bm{I}).
+\]
+但程序使用的是有限终点 \(T\)，所以严格地说
+\[
+  q(\bm{x}_T\mid\bm{x}_0,\bm{y})
+  =
+  \mathcal{N}\!\left(
+    \bm{y}+a_T(\bm{x}_0-\bm{y}),v_T\bm{I}
+  \right),
+\]
+只有当 \(a_T\) 足够小时，它才近似于
+\(\mathcal{N}(\bm{y},\lambda^2\bm{I})\)。因此，推理初始化
+\(\bm{x}_T=\bm{y}+\sqrt{v_T}\bm{\xi}\) 是以观测为中心的终点近似；
+它并未显式加入条件均值中的 \(a_T(\bm{x}_0-\bm{y})\) 项。
+
+项目默认令 \(T=100\)、\(\theta=5/T=0.05\)、\(\lambda=0.1\)。
+此时 \(a_T=e^{-5}\)，而 \(v_T\) 已非常接近 \(\lambda^2\)，但
+\(a_T\) 仍不是严格的零。系数随时间的变化见表
+\ref{tab:schedule}。
+
+\begin{table}[htbp]
+\centering
+\caption{默认参数下的前向过程系数（\(T=100,\theta=0.05,\lambda=0.1\)）}
+\label{tab:schedule}
+\begin{tabular}{ccccc}
+\toprule
+时间 \(t\) & \(a_t=e^{-\theta t}\) & \(v_t\) & \(\sigma_t=\sqrt{v_t}\)
+& 条件均值 \\
+\midrule
+\(0\) & \(1.000000\) & \(0\) & \(0\)
+& \(\bm{x}_0\) \\
+\(50\) & \(0.082085\) & \(0.009933\) & \(0.099663\)
+& \(\bm{y}+0.082085(\bm{x}_0-\bm{y})\) \\
+\(100\) & \(0.006738\) & \(0.0099995\) & \(0.099998\)
+& \(\bm{y}+0.006738(\bm{x}_0-\bm{y})\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{模型预测目标与变量转换}
+
+\subsection{两种预测目标及其训练损失}
+
+对于每个训练批次，程序对每个样本独立地从
+\(\{1,\ldots,T\}\) 均匀采样一个整数时间步，再采样
+\(\bm{\epsilon}\sim\mathcal{N}(\bm{0},\bm{I})\)，并依据
+式 \eqref{eq:forward-code} 构造 \(\bm{x}_t\)。网络输入为
+\((\bm{x}_t,\bm{y},t)\)，其输出记为
+\[
+  \bm{r}_\theta=f_\theta(\bm{x}_t,\bm{y},t).
+\]
+配置支持两类监督目标：
+
+\begin{enumerate}[label=(\arabic*)]
+  \item \textbf{sample 预测：}令网络直接预测干净图像，监督目标为
+  \(\bm{x}_0\)；
+  \item \textbf{epsilon 预测：}令网络预测前向过程中的标准高斯噪声，
+  监督目标为 \(\bm{\epsilon}\)。
+\end{enumerate}
+
+两种模式使用的均方误差目标可统一写为
+\begin{equation}
+  \mathcal{L}(\theta)
+  =
+  \mathbb{E}_{(\bm{x}_0,\bm{y}),\,t,\,\bm{\epsilon}}
+  \left[
+    \left\|
+      f_\theta(\bm{x}_t,\bm{y},t)-\bm{z}
+    \right\|_2^2
+  \right],
+  \qquad
+  \bm{z}=
+  \begin{cases}
+    \bm{x}_0, & \text{sample 模式},\\
+    \bm{\epsilon}, & \text{epsilon 模式}.
+  \end{cases}
+  \label{eq:loss}
+\end{equation}
+程序默认使用 sample 模式，也允许通过配置选择 epsilon 模式。
+均方误差训练下，理想的函数回归解是给定输入条件下目标变量的
+条件期望；实际网络输出是这一回归目标的近似，并不意味着对单个
+样本潜变量的精确反演。
+
+\subsection{从 epsilon 预测反推干净图像}
+
+从前向关系式
+\[
+  \bm{x}_t-\bm{y}
+  =a_t(\bm{x}_0-\bm{y})+\sigma_t\bm{\epsilon}
+\]
+出发。若网络输出 \(\widehat{\bm{\epsilon}}\)，将其代入噪声位置，
+并对 \(\bm{x}_0\) 做代数移项：
+\begin{align}
+  \bm{x}_t-\bm{y}
+  &=a_t(\widehat{\bm{x}}_0-\bm{y})
+    +\sigma_t\widehat{\bm{\epsilon}},
+  \\
+  a_t(\widehat{\bm{x}}_0-\bm{y})
+  &=\bm{x}_t-\bm{y}
+    -\sigma_t\widehat{\bm{\epsilon}},
+  \\
+  \widehat{\bm{x}}_0-\bm{y}
+  &=\frac{
+      \bm{x}_t-\bm{y}-\sigma_t\widehat{\bm{\epsilon}}
+    }{a_t},
+  \\
+  \widehat{\bm{x}}_0
+  &=\bm{y}
+    +\frac{
+      \bm{x}_t-\bm{y}-\sigma_t\widehat{\bm{\epsilon}}
+    }{a_t}.
+  \label{eq:epsilon-to-x0}
+\end{align}
+因为训练时间步满足 \(t\geq 1\)，且 \(a_t=e^{-\theta t}>0\)，
+该除法在数学上有定义。随着 \(t\) 增大，\(a_t\) 变小，因此 epsilon
+预测中的误差可能经除以 \(a_t\) 放大；这一代数事实也解释了为什么
+不同预测目标的数值稳定性可能不同。
+
+反过来，若已得到干净图像估计
+\(\widehat{\bm{x}}_0\)，由同一前向式解出标准化噪声：
+\begin{align}
+  \bm{x}_t-\bm{y}
+  &=a_t(\widehat{\bm{x}}_0-\bm{y})
+    +\sigma_t\widehat{\bm{\epsilon}},
+  \\
+  \widehat{\bm{\epsilon}}
+  &=\frac{
+     \bm{x}_t-\bm{y}-a_t(\widehat{\bm{x}}_0-\bm{y})
+    }{\sigma_t}.
+  \label{eq:x0-to-epsilon}
+\end{align}
+当网络采用 sample 模式时，\(\bm{r}_\theta\) 即
+\(\widehat{\bm{x}}_0\)，并可通过式 \eqref{eq:x0-to-epsilon}
+求得配套的残差噪声。由于 \(\sigma_t>0\) 对所有 \(t\geq1\)
+成立，该转换在代码所允许的正时间步上有定义。
+
+上述过程主要是从高斯重参数化式出发的代数变换，而不是单独应用
+贝叶斯公式求闭式后验。若从统计学习角度解释，MSE 训练会使网络
+逼近给定输入下目标变量的条件均值；\texttt{prediction\_to\_x0\_noise}
+则将该网络输出转换成调度器统一使用的
+\((\widehat{\bm{x}}_0,\widehat{\bm{\epsilon}})\) 表示。
+
+\begin{table}[htbp]
+\centering
+\caption{预测目标与统一变量转换}
+\label{tab:prediction}
+\begin{tabular}{p{0.17\linewidth}p{0.23\linewidth}p{0.48\linewidth}}
+\toprule
+模式 & 训练监督目标 & 推理时得到的变量 \\
+\midrule
+sample
+& \(\bm{x}_0\)
+& \(\widehat{\bm{x}}_0=\bm{r}_\theta\)，再用式
+  \eqref{eq:x0-to-epsilon} 得到
+  \(\widehat{\bm{\epsilon}}\)。 \\
+epsilon
+& \(\bm{\epsilon}\)
+& \(\widehat{\bm{\epsilon}}=\bm{r}_\theta\)，再用式
+  \eqref{eq:epsilon-to-x0} 得到
+  \(\widehat{\bm{x}}_0\)。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{裁剪操作的含义与噪声重算}
+
+调度器在执行采样步时可将干净图像估计裁剪至合法像素范围：
+\[
+  \widehat{\bm{x}}_0
+  \leftarrow
+  \Pi_{[0,1]}(\widehat{\bm{x}}_0)
+  =
+  \min\!\bigl(1,\max(0,\widehat{\bm{x}}_0)\bigr),
+\]
+其中 \(\Pi_{[0,1]}\) 表示逐像素投影到区间 \([0,1]\)。这利用了
+训练图像的像素取值范围，防止网络对干净图像的估计落在无效范围。
+它不是新的概率推断步骤，也不保证投影后的像素更接近真实值；
+它是采样阶段的约束与数值后处理。
+
+裁剪会改变 \(\widehat{\bm{x}}_0\)，所以原先网络输出的噪声一般不再
+与新的 \(\widehat{\bm{x}}_0\) 满足同一个前向重构等式。代码因此在
+裁剪之后重新计算
+\[
+  \widehat{\bm{\epsilon}}
+  =
+  \frac{
+    \bm{x}_t-\bm{y}
+    -a_t(\widehat{\bm{x}}_0-\bm{y})
+  }{\sigma_t}.
+\]
+于是裁剪后的 \(\widehat{\bm{x}}_0\) 与重算的
+\(\widehat{\bm{\epsilon}}\) 在当前 \(t\) 时刻仍严格满足
+\[
+  \bm{x}_t
+  =\bm{y}
+    +a_t(\widehat{\bm{x}}_0-\bm{y})
+    +\sigma_t\widehat{\bm{\epsilon}}.
+\]
+在本项目中，训练阶段为诊断而调用变量转换时不启用该裁剪；
+\texttt{step} 采样阶段则依据 \texttt{clip\_sample} 配置启用裁剪，
+默认配置为开启。
+
+\section{反向跳步采样机制}
+
+\subsection{节点选择与初始化}
+
+设推理节点为严格递减序列
+\[
+  T=t_0>t_1>\cdots>t_{K-1}\geq1,
+\]
+并在其后追加终点 \(t_K=0\)。代码可以按给定推理步数从
+\(T\) 到 \(1\) 生成节点，也可以接受从 \(T\) 开始的自定义严格
+递减整数节点。相邻推理循环变量分别是当前时刻
+\(i=t_k\) 和前一推理时刻 \(j=t_{k+1}\)，因而允许 \(j<i-1\)，
+即一次更新跨越多个训练时刻。
+
+采样开始时，程序抽取
+\(\bm{\xi}\sim\mathcal{N}(\bm{0},\bm{I})\)，并令
+\begin{equation}
+  \bm{x}_T=\bm{y}+\sqrt{v_T}\,\bm{\xi}.
+  \label{eq:init}
+\end{equation}
+这对应于使用近似终点分布
+\(\mathcal{N}(\bm{y},v_T\bm{I})\) 初始化。随后 UNet 每一步都接收
+当前状态与固定观测的通道拼接
+\(\operatorname{cat}[\bm{x}_i,\bm{y}]\)，并输出配置所指定的
+sample 或 epsilon 预测。
+
+\subsection{从当前时刻重构到较早时刻}
+
+在当前时刻 \(i\)，调度器先把网络输出转换为一致的
+\((\widehat{\bm{x}}_0,\widehat{\bm{\epsilon}})\)：
+\begin{align}
+  \bm{x}_i
+  &=\bm{y}
+    +a_i(\widehat{\bm{x}}_0-\bm{y})
+    +\sigma_i\widehat{\bm{\epsilon}}.
+  \label{eq:current-reconstruction}
+\end{align}
+在当前估计下，时间 \(j\) 的重构状态定义为
+\begin{equation}
+  \bm{x}_j
+  =
+  \bm{y}
+  +a_j(\widehat{\bm{x}}_0-\bm{y})
+  +\sigma_j\widehat{\bm{\epsilon}},
+  \qquad j<i.
+  \label{eq:reverse-step}
+\end{equation}
+式 \eqref{eq:reverse-step} 分别将同一干净图像估计与同一标准化噪声
+按较早时刻的系数重新组合。它不是将当前 \(\bm{x}_i\) 原样缩放，
+而是先分解当前状态中“相对观测的信号项”和“高斯噪声项”，再用
+\(a_j,\sigma_j\) 重建。
+
+当 \(j=0\) 时，
+\[
+  a_0=1,\qquad \sigma_0=0,
+\]
+故更新退化为
+\[
+  \bm{x}_0^{\mathrm{out}}
+  =\bm{y}+(\widehat{\bm{x}}_0-\bm{y})
+  =\widehat{\bm{x}}_0.
+\]
+也就是说，最后一步输出的是当前网络估计的干净图像；若采样时启用
+裁剪，则这里的估计已经先被投影到 \([0,1]\)。
+
+\subsection{跳步的性质与随机性来源}
+
+式 \eqref{eq:reverse-step} 在一次更新中没有新采样随机变量，因此
+给定初始噪声、观测图像与网络参数后，后续轨迹是确定的。随机性
+来自式 \eqref{eq:init} 的初始噪声，而不是每个反向跳步额外注入的
+噪声。对于稀疏推理节点，算法仍按所选 \(j\) 的边缘系数直接重构，
+而不必逐个计算 \(i-1,i-2,\ldots,j\) 的中间状态。
+
+这是一种基于预测干净样本与预测噪声的确定性跳步重构形式，结构上
+与 DDIM 式更新相似。需要准确区分：它利用了前向过程的边缘关系
+构造一致的较早时刻状态，但该操作本身并不等于对精确反向条件
+分布 \(q(\bm{x}_j\mid\bm{x}_i,\bm{x}_0,\bm{y})\) 进行随机抽样。
+实际效果还取决于网络对 \(\bm{x}_0\) 或 \(\bm{\epsilon}\) 的预测误差。
+
+\subsection{有限值检查与输出裁剪}
+
+CIFAR 推理循环在最终裁剪前先检查输出是否包含非有限值；若有
+\(\mathrm{NaN}\) 或无穷值则报告错误，而不是将异常值静默转换为
+看似有效的图像。检查通过后，pipeline 执行
+\[
+  \bm{x}_{\mathrm{out}}=
+  \operatorname{clamp}(\bm{x},0,1).
+\]
+理由是数据集中的干净图像采用 \([0,1]\) 像素约定，而网络计算及
+SDE 公式并不会自动保证最终预测落在该区间。最终裁剪使返回图像
+满足合法像素范围，并适配后续图像显示与保存。应注意，最终输出
+裁剪与调度器内部对 \(\widehat{\bm{x}}_0\) 的裁剪发生在不同位置：
+前者约束 pipeline 的最终输出，后者会影响反向跳步中重算的噪声。
+
+\begin{table}[htbp]
+\centering
+\caption{采样阶段各步骤及其数学作用}
+\label{tab:sampling}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.38\linewidth}}
+\toprule
+阶段 & 计算 & 作用 \\
+\midrule
+初始化
+& \(\bm{x}_T=\bm{y}+\sigma_T\bm{\xi}\)
+& 以观测为中心构造近似终点状态。 \\
+预测与转换
+& \(f_\theta(\bm{x}_i,\bm{y},i)
+  \mapsto(\widehat{\bm{x}}_0,\widehat{\bm{\epsilon}})\)
+& 将两类训练目标统一成采样所需的变量对。 \\
+跳步
+& \(\bm{x}_j=\bm{y}+a_j(\widehat{\bm{x}}_0-\bm{y})
++\sigma_j\widehat{\bm{\epsilon}}\)
+& 用较早时刻的系数重建状态，不在此步另抽噪声。 \\
+结束
+& \(j=0\)，随后输出 clamp
+& 得到干净图像估计，并限制其像素范围。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{CIFAR UNet 结构与六通道输入}
+
+\subsection{为何将 \(\bm{x}_t\) 与 \(\bm{y}\) 拼接}
+
+CIFAR-10 图像有三个颜色通道。当前扩散状态
+\(\bm{x}_t\in\mathbb{R}^{B\times3\times H\times W}\)，观测
+\(\bm{y}\in\mathbb{R}^{B\times3\times H\times W}\)。项目沿通道维
+拼接：
+\begin{equation}
+  \bm{u}_t
+  =
+  \operatorname{cat}[\bm{x}_t,\bm{y};\operatorname{dim}=1]
+  \in\mathbb{R}^{B\times6\times H\times W}.
+\end{equation}
+因此输入为六通道，其中前三个通道是随时间变化的状态，后三个通道
+是固定的条件观测。这一设计让卷积网络在每个空间位置都能同时访问
+当前待恢复内容与对应的观测像素，并在多层卷积中学习两者的局部
+对应关系。若只输入 \(\bm{x}_t\)，网络就没有显式获得该样本的
+条件观测；通道拼接是将条件信息直接提供给 UNet 的一种简单实现。
+
+这种拼接并不意味着模型把六个通道都当成待预测的图像。网络的
+输出通道数为三，对应 RGB 图像形状；输出语义由调度器配置决定：
+sample 模式下是三通道 \(\widehat{\bm{x}}_0\)，epsilon 模式下是
+三通道 \(\widehat{\bm{\epsilon}}\)。
+
+\subsection{实现中的 UNet 配置}
+
+CIFAR UNet 的空间输入大小为 \(32\times32\)，
+\texttt{in\_channels=6}、\texttt{out\_channels=3}，
+\texttt{block\_out\_channels=(64,128)}，每个 block 配置
+\texttt{layers\_per\_block=2}，归一化组数为 \(8\)。下采样路径和
+上采样路径各配置两个 \texttt{DownBlock2D} 与
+\texttt{UpBlock2D}。网络同时接收时间步 \(t\)，因此函数可写为
+\[
+  f_\theta:
+  \mathbb{R}^{B\times6\times32\times32}\times t
+  \longrightarrow
+  \mathbb{R}^{B\times3\times32\times32}.
+\]
+
+从功能上看，下采样路径通过卷积特征变换和空间尺度压缩，逐步扩大
+特征的有效感受野，使网络能够利用更大范围的图像上下文；上采样路径
+逐步恢复空间分辨率，将高层语义信息映射回像素尺度。UNet 的跳跃
+连接将较浅层的高分辨率特征传递到对应的上采样阶段，有助于同时
+保留边缘、纹理等局部细节与深层语义信息。时间步嵌入使相同的卷积
+网络能够根据当前噪声尺度改变预测行为。
+
+\begin{table}[htbp]
+\centering
+\caption{CIFAR-10 条件 UNet 的关键结构配置}
+\label{tab:unet}
+\begin{tabular}{lll}
+\toprule
+配置项 & 实际取值 & 对应含义 \\
+\midrule
+输入分辨率 & \(32\times32\) & CIFAR-10 的空间尺寸 \\
+输入通道 & \(6\) & \(3\) 通道 \(\bm{x}_t\) 加 \(3\) 通道 \(\bm{y}\) \\
+输出通道 & \(3\) & RGB 的 sample 或 epsilon 预测 \\
+Block 通道宽度 & \((64,128)\) & 两级特征通道配置 \\
+每个 Block 层数 & \(2\) & 每个阶段的层数配置 \\
+归一化组数 & \(8\) & Group Normalization 配置 \\
+下采样/上采样类型
+& \texttt{DownBlock2D}/\texttt{UpBlock2D}
+& 编码与解码路径 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{方法流程总结与实现对应关系}
+
+将训练与推理合并来看，IR-SDE 的关键并非在每一时刻重新独立预测
+一张无条件图像，而是围绕同一个观测 \(\bm{y}\) 建立由干净图像到
+观测邻域的前向过程，再学习在不同噪声尺度下从状态中恢复干净
+图像信息。训练时对每张配对样本执行
+\[
+  (\bm{x}_0,\bm{y})
+  \longrightarrow
+  t,\bm{\epsilon}
+  \longrightarrow
+  \bm{x}_t
+  \longrightarrow
+  f_\theta(\bm{x}_t,\bm{y},t)
+  \longrightarrow
+  \mathcal{L};
+\]
+推理时则执行
+\[
+  \bm{y}
+  \longrightarrow
+  \bm{x}_T
+  \longrightarrow
+  (\widehat{\bm{x}}_0,\widehat{\bm{\epsilon}})
+  \longrightarrow
+  \bm{x}_{t_{k+1}}
+  \longrightarrow\cdots\longrightarrow
+  \widehat{\bm{x}}_0.
+\]
+
+综上，代码中的核心数学对象可以归纳为以下四点：
+\begin{enumerate}[label=\arabic*.]
+  \item 前向 SDE 的回复中心是观测图像 \(\bm{y}\)，其解析边缘分布
+  使任意训练时间步的 \(\bm{x}_t\) 都可一次闭式采样。
+  \item 网络可学习预测 \(\bm{x}_0\) 或标准高斯噪声
+  \(\bm{\epsilon}\)；调度器通过代数变换将两种输出统一为
+  \((\widehat{\bm{x}}_0,\widehat{\bm{\epsilon}})\)。
+  \item 反向跳步以较早时刻的 \(a_j,\sigma_j\) 重构状态，
+  不需要按训练步数逐步遍历，也不在每个跳步重新注入随机噪声。
+  \item CIFAR UNet 将当前状态与观测拼接成六通道条件输入，
+  并输出三通道预测；最终结果再限制在 \([0,1]\) 像素区间。
+\end{enumerate}
+
+\end{document}
